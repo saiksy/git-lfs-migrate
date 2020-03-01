@@ -30,14 +30,15 @@ import java.util.*;
 import java.util.stream.Collectors;
 
 /**
- * Converter for git objects.
- * Created by bozaro on 09.06.15.
+ * Converter for git objects. Created by bozaro on 09.06.15.
  */
 public class GitConverter {
   @NotNull
   private static final Logger log = LoggerFactory.getLogger(GitConverter.class);
   @NotNull
   private static final String GIT_ATTRIBUTES = ".gitattributes";
+  @NotNull
+  private static final String LFS_CONFIG = ".lfsconfig";
   @NotNull
   private final String[] globs;
   @NotNull
@@ -50,12 +51,16 @@ public class GitConverter {
   private final Path tempPath;
   @NotNull
   private final HTreeMap<String, MetaData> cacheMeta;
+  @NotNull
+  private final String lfsurl;
 
-  public GitConverter(@NotNull DB cache, @NotNull Path basePath, @NotNull String[] globs) throws IOException, InvalidPatternException {
+  public GitConverter(@NotNull DB cache, @NotNull Path basePath, @NotNull String[] globs, @NotNull String lfsurl)
+      throws IOException, InvalidPatternException {
     this.basePath = basePath;
     this.cache = cache;
     this.globs = globs.clone();
     this.matchers = convertGlobs(globs);
+    this.lfsurl = lfsurl;
     Arrays.sort(globs);
 
     for (String glob : globs) {
@@ -64,11 +69,9 @@ public class GitConverter {
 
     tempPath = basePath.resolve("lfs/tmp");
     Files.createDirectories(tempPath);
-    //noinspection unchecked
-    cacheMeta = cache.<String, MetaData>hashMap("meta")
-        .keySerializer(Serializer.STRING)
-        .valueSerializer(new SerializerJava())
-        .createOrOpen();
+    // noinspection unchecked
+    cacheMeta = cache.<String, MetaData>hashMap("meta").keySerializer(Serializer.STRING)
+        .valueSerializer(new SerializerJava()).createOrOpen();
   }
 
   @NotNull
@@ -91,10 +94,13 @@ public class GitConverter {
         if (revObject instanceof RevTag) {
           return convertTagTask((RevTag) revObject);
         }
-        throw new IllegalStateException("Unsupported object type: " + key + " (" + revObject.getClass().getName() + ")");
+        throw new IllegalStateException(
+            "Unsupported object type: " + key + " (" + revObject.getClass().getName() + ")");
       }
       case Attribute:
         return createAttributesTask(reader, key.getObjectId());
+      case LfsConfig:
+        return createLfsConfigTask(reader, key.getObjectId());
       case UploadLfs:
         return convertLfsTask(reader, key.getObjectId());
       default:
@@ -112,7 +118,8 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         return objectId;
       }
     };
@@ -124,14 +131,13 @@ public class GitConverter {
       @NotNull
       @Override
       public Iterable<TaskKey> depends() {
-        return Collections.singletonList(
-            new TaskKey(TaskType.Simple, "", revObject.getObject())
-        );
+        return Collections.singletonList(new TaskKey(TaskType.Simple, "", revObject.getObject()));
       }
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         final ObjectId id = resolver.resolve(TaskType.Simple, "", revObject.getObject());
         final TagBuilder builder = new TagBuilder();
         builder.setMessage(revObject.getFullMessage());
@@ -159,7 +165,8 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         final CommitBuilder builder = new CommitBuilder();
         builder.setAuthor(revObject.getAuthorIdent());
         builder.setCommitter(revObject.getCommitterIdent());
@@ -184,6 +191,7 @@ public class GitConverter {
         final List<GitTreeEntry> entries = new ArrayList<>();
         final CanonicalTreeParser treeParser = new CanonicalTreeParser(null, reader, id);
         boolean needAttributes = path.isEmpty();
+        boolean needLfsConfig = path.isEmpty();
         while (!treeParser.eof()) {
           final FileMode fileMode = treeParser.getEntryFileMode();
           final TaskType blobTask;
@@ -192,6 +200,10 @@ public class GitConverter {
             blobTask = TaskType.Attribute;
             pathTask = null;
             needAttributes = false;
+          } else if (needLfsConfig && treeParser.getEntryPathString().equals(LFS_CONFIG)) {
+            blobTask = TaskType.LfsConfig;
+            pathTask = null;
+            needLfsConfig = false;
           } else if (isFile(fileMode) && matchFilename(path + "/" + treeParser.getEntryPathString())) {
             blobTask = TaskType.UploadLfs;
             pathTask = null;
@@ -199,17 +211,24 @@ public class GitConverter {
             blobTask = TaskType.Simple;
             pathTask = path + "/" + treeParser.getEntryPathString();
           }
-          entries.add(new GitTreeEntry(fileMode, new TaskKey(blobTask, pathTask, treeParser.getEntryObjectId()), treeParser.getEntryPathString()));
+          entries.add(new GitTreeEntry(fileMode, new TaskKey(blobTask, pathTask, treeParser.getEntryObjectId()),
+              treeParser.getEntryPathString()));
           treeParser.next();
         }
         if (needAttributes && globs.length > 0) {
-          entries.add(new GitTreeEntry(FileMode.REGULAR_FILE, new TaskKey(TaskType.Attribute, null, ObjectId.zeroId()), GIT_ATTRIBUTES));
+          entries.add(new GitTreeEntry(FileMode.REGULAR_FILE, new TaskKey(TaskType.Attribute, null, ObjectId.zeroId()),
+              GIT_ATTRIBUTES));
+        }
+        if (needLfsConfig && !lfsurl.isEmpty()) {
+          entries.add(new GitTreeEntry(FileMode.REGULAR_FILE, new TaskKey(TaskType.LfsConfig, null, ObjectId.zeroId()),
+              LFS_CONFIG));
         }
         return entries;
       }
 
       private boolean isFile(@NotNull FileMode fileMode) {
-        return (fileMode.getObjectType() == Constants.OBJ_BLOB) && ((fileMode.getBits() & FileMode.TYPE_MASK) == FileMode.TYPE_FILE);
+        return (fileMode.getObjectType() == Constants.OBJ_BLOB)
+            && ((fileMode.getBits() & FileMode.TYPE_MASK) == FileMode.TYPE_FILE);
       }
 
       @NotNull
@@ -220,7 +239,8 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         final List<GitTreeEntry> entries = getEntries();
         // Create new tree.
         Collections.sort(entries);
@@ -270,16 +290,19 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         final ObjectLoader loader = reader.open(id, Constants.OBJ_BLOB);
         // Is empty blob (see #21)?
         if (loader.getSize() == 0) {
-          if (dstRepo.hasObject(id)) return id;
+          if (dstRepo.hasObject(id))
+            return id;
           return copy(inserter, loader);
         }
         // Is object already converted?
         if (isLfsPointer(loader)) {
-          if (dstRepo.hasObject(id)) return id;
+          if (dstRepo.hasObject(id))
+            return id;
           return copy(inserter, loader);
         }
         final String hash = (uploader == null) ? createLocalFile(id, loader) : createRemoteFile(id, loader, uploader);
@@ -302,7 +325,8 @@ public class GitConverter {
   }
 
   @NotNull
-  private String createRemoteFile(@NotNull ObjectId id, @NotNull ObjectLoader loader, @NotNull Uploader uploader) throws IOException {
+  private String createRemoteFile(@NotNull ObjectId id, @NotNull ObjectLoader loader, @NotNull Uploader uploader)
+      throws IOException {
     // Create LFS stream.
     final String hash;
     final MetaData cached = cacheMeta.get(id.name());
@@ -313,7 +337,8 @@ public class GitConverter {
         byte[] buffer = new byte[0x10000];
         while (true) {
           int read = istream.read(buffer);
-          if (read <= 0) break;
+          if (read <= 0)
+            break;
           md.update(buffer, 0, read);
           size += read;
         }
@@ -335,12 +360,12 @@ public class GitConverter {
     final Path tmpFile = tempPath.resolve(UUID.randomUUID().toString());
     final MessageDigest md = createSha256();
     int size = 0;
-    try (InputStream istream = loader.openStream();
-         OutputStream ostream = Files.newOutputStream(tmpFile)) {
+    try (InputStream istream = loader.openStream(); OutputStream ostream = Files.newOutputStream(tmpFile)) {
       byte[] buffer = new byte[0x10000];
       while (true) {
         int read = istream.read(buffer);
-        if (read <= 0) break;
+        if (read <= 0)
+          break;
         ostream.write(buffer, 0, read);
         md.update(buffer, 0, read);
         size += read;
@@ -350,7 +375,8 @@ public class GitConverter {
     cacheMeta.putIfAbsent(id.name(), new MetaData(hash, size));
     cache.commit();
     // Rename file.
-    final Path lfsFile = basePath.resolve("lfs/objects/" + hash.substring(0, 2) + "/" + hash.substring(2, 4) + "/" + hash);
+    final Path lfsFile = basePath
+        .resolve("lfs/objects/" + hash.substring(0, 2) + "/" + hash.substring(2, 4) + "/" + hash);
     Files.createDirectories(lfsFile.getParent());
     if (Files.exists(lfsFile)) {
       try {
@@ -380,7 +406,8 @@ public class GitConverter {
   }
 
   @NotNull
-  private ConvertTask createAttributesTask(@NotNull final ObjectReader reader, @Nullable ObjectId id) throws IOException {
+  private ConvertTask createAttributesTask(@NotNull final ObjectReader reader, @Nullable ObjectId id)
+      throws IOException {
     return new ConvertTask() {
       @NotNull
       @Override
@@ -390,16 +417,19 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
         final Set<String> attributes = new TreeSet<>();
         for (String glob : globs) {
           attributes.add(glob + "\tfilter=lfs diff=lfs merge=lfs -text");
         }
         final ByteArrayOutputStream blob = new ByteArrayOutputStream();
-        try (BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(openAttributes(reader, id), StandardCharsets.UTF_8))) {
+        try (BufferedReader bufferedReader = new BufferedReader(
+            new InputStreamReader(openAttributes(reader, id), StandardCharsets.UTF_8))) {
           while (true) {
             String line = bufferedReader.readLine();
-            if (line == null) break;
+            if (line == null)
+              break;
             if (!attributes.remove(line)) {
               blob.write(line.getBytes(StandardCharsets.UTF_8));
               blob.write('\n');
@@ -407,6 +437,33 @@ public class GitConverter {
           }
         }
         for (String line : attributes) {
+          blob.write(line.getBytes(StandardCharsets.UTF_8));
+          blob.write('\n');
+        }
+        return inserter.insert(Constants.OBJ_BLOB, blob.toByteArray());
+      }
+    };
+  }
+
+  @NotNull
+  private ConvertTask createLfsConfigTask(@NotNull final ObjectReader reader, @Nullable ObjectId id)
+      throws IOException {
+    return new ConvertTask() {
+      @NotNull
+      @Override
+      public Iterable<TaskKey> depends() throws IOException {
+        return Collections.emptyList();
+      }
+
+      @NotNull
+      @Override
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+        final Set<String> lfsconfig = new TreeSet<>();
+        lfsconfig.add("[lfs]");
+        lfsconfig.add("url = \"" + lfsurl + "\"");
+        final ByteArrayOutputStream blob = new ByteArrayOutputStream();
+        for (String line : lfsconfig) {
           blob.write(line.getBytes(StandardCharsets.UTF_8));
           blob.write('\n');
         }
@@ -425,8 +482,10 @@ public class GitConverter {
 
       @NotNull
       @Override
-      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
-        if (dstRepo.hasObject(id)) return id;
+      public ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter,
+          @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException {
+        if (dstRepo.hasObject(id))
+          return id;
         return copy(inserter, reader.open(id));
       }
     };
@@ -441,10 +500,7 @@ public class GitConverter {
   }
 
   public enum TaskType {
-    EndMark(false),
-    Simple(true),
-    Attribute(false),
-    UploadLfs(false);
+    EndMark(false), Simple(true), Attribute(false), LfsConfig(false), UploadLfs(false);
 
     TaskType(boolean needPath) {
       this.needPath = needPath;
@@ -472,7 +528,8 @@ public class GitConverter {
     Iterable<TaskKey> depends() throws IOException;
 
     @NotNull
-    ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver, @Nullable Uploader uploader) throws IOException;
+    ObjectId convert(@NotNull Repository dstRepo, @NotNull ObjectInserter inserter, @NotNull ConvertResolver resolver,
+        @Nullable Uploader uploader) throws IOException;
   }
 
   @FunctionalInterface

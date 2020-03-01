@@ -56,12 +56,16 @@ public class Main {
     }
     final long time = System.currentTimeMillis();
     final Client client;
+    final String lfsurl;
     if (cmd.lfs != null) {
       client = createClient(new BasicAuthProvider(URI.create(cmd.lfs)), cmd);
+      lfsurl = cmd.lfs;
     } else if (cmd.git != null) {
       client = createClient(AuthHelper.create(cmd.git), cmd);
+      lfsurl = cmd.git;
     } else {
       client = null;
+      lfsurl = null;
     }
     if (!checkLfsAuthenticate(client)) {
       return;
@@ -74,14 +78,11 @@ public class Main {
     }
     String[] globs = cmd.globs.toArray(new String[cmd.globs.size()]);
     if (cmd.globFile != null) {
-      globs = Stream.concat(Arrays.stream(globs),
-          Files.lines(cmd.globFile)
-              .map(String::trim)
-              .filter(s -> !s.isEmpty())
-      ).toArray(String[]::new);
+      globs = Stream.concat(Arrays.stream(globs), Files.lines(cmd.globFile).map(String::trim).filter(s -> !s.isEmpty()))
+          .toArray(String[]::new);
     }
     try {
-      processRepository(cmd.src, cmd.dst, cmd.cache, client, cmd.writeThreads, cmd.uploadThreads, globs);
+      processRepository(cmd.src, cmd.dst, cmd.cache, client, cmd.writeThreads, cmd.uploadThreads, lfsurl, globs);
     } catch (ExecutionException e) {
       if (e.getCause() instanceof RequestException) {
         final RequestException cause = (RequestException) e.getCause();
@@ -98,9 +99,7 @@ public class Main {
     httpBuilder.setUserAgent("git-lfs-migrate");
     if (cmd.noCheckCertificate) {
       httpBuilder.setSSLHostnameVerifier((hostname, session) -> true);
-      httpBuilder.setSSLContext(SSLContexts.custom()
-          .loadTrustMaterial((chain, authType) -> true)
-          .build());
+      httpBuilder.setSSLContext(SSLContexts.custom().loadTrustMaterial((chain, authType) -> true).build());
     }
     return new Client(auth, httpBuilder.build());
   }
@@ -110,11 +109,7 @@ public class Main {
       return true;
     final Meta meta = new Meta("0123456789012345678901234567890123456789012345678901234567890123", 42);
     try {
-      BatchRes response = client.postBatch(
-          new BatchReq(Operation.Upload, Collections.singletonList(
-              meta
-          ))
-      );
+      BatchRes response = client.postBatch(new BatchReq(Operation.Upload, Collections.singletonList(meta)));
       if (response.getObjects().size() != 1) {
         log.error("LFS server: Invalid response for test batch request");
       }
@@ -143,28 +138,25 @@ public class Main {
     return false;
   }
 
-  public static void processRepository(@NotNull Path srcPath, @NotNull Path dstPath, @NotNull Path cachePath, @Nullable Client client, int writeThreads, int uploadThreads, @NotNull String... globs) throws IOException, InterruptedException, ExecutionException, InvalidPatternException {
+  public static void processRepository(@NotNull Path srcPath, @NotNull Path dstPath, @NotNull Path cachePath,
+      @Nullable Client client, int writeThreads, int uploadThreads, String lfsurl, @NotNull String... globs)
+      throws IOException, InterruptedException, ExecutionException, InvalidPatternException {
     removeDirectory(dstPath);
     Files.createDirectories(dstPath);
 
-    final Repository srcRepo = new FileRepositoryBuilder()
-        .setMustExist(true)
-        .setGitDir(srcPath.toFile()).build();
-    final Repository dstRepo = new FileRepositoryBuilder()
-        .setMustExist(false)
-        .setGitDir(dstPath.toFile()).build();
+    final Repository srcRepo = new FileRepositoryBuilder().setMustExist(true).setGitDir(srcPath.toFile()).build();
+    final Repository dstRepo = new FileRepositoryBuilder().setMustExist(false).setGitDir(dstPath.toFile()).build();
 
-    try (DB cache = DBMaker.fileDB(cachePath.resolve("git-lfs-migrate.mapdb").toFile())
-        .fileMmapEnableIfSupported()
-        .checksumHeaderBypass()
-        .make()) {
-      final GitConverter converter = new GitConverter(cache, dstPath, globs);
+    try (DB cache = DBMaker.fileDB(cachePath.resolve("git-lfs-migrate.mapdb").toFile()).fileMmapEnableIfSupported()
+        .checksumHeaderBypass().make()) {
+      final GitConverter converter = new GitConverter(cache, dstPath, globs, lfsurl);
       dstRepo.create(true);
       // Load all revision list.
       ConcurrentMap<TaskKey, ObjectId> converted = new ConcurrentHashMap<>();
       try (HttpUploader uploader = createHttpUploader(srcRepo, client, uploadThreads)) {
         log.info("Converting object without dependencies in " + writeThreads + " threads...");
-        Deque<TaskKey> pass2 = processWithoutDependencies(converter, srcRepo, dstRepo, converted, uploader, writeThreads);
+        Deque<TaskKey> pass2 = processWithoutDependencies(converter, srcRepo, dstRepo, converted, uploader,
+            writeThreads);
         log.info("Converting object with dependencies in single thread...");
         processSingleThread(converter, srcRepo, dstRepo, converted, uploader, pass2);
       }
@@ -185,11 +177,14 @@ public class Main {
   }
 
   @Nullable
-  private static HttpUploader createHttpUploader(@NotNull Repository repository, @Nullable Client client, int uploadThreads) {
+  private static HttpUploader createHttpUploader(@NotNull Repository repository, @Nullable Client client,
+      int uploadThreads) {
     return client == null ? null : new HttpUploader(repository, client, uploadThreads);
   }
 
-  private static void processSingleThread(@NotNull GitConverter converter, @NotNull Repository srcRepo, @NotNull Repository dstRepo, @NotNull Map<TaskKey, ObjectId> converted, @Nullable HttpUploader uploader, @NotNull Deque<TaskKey> queue) throws IOException {
+  private static void processSingleThread(@NotNull GitConverter converter, @NotNull Repository srcRepo,
+      @NotNull Repository dstRepo, @NotNull Map<TaskKey, ObjectId> converted, @Nullable HttpUploader uploader,
+      @NotNull Deque<TaskKey> queue) throws IOException {
     try (ProgressReporter reporter = new ProgressReporter("processed", new AtomicLong(queue.size()), null)) {
       final ObjectInserter inserter = dstRepo.newObjectInserter();
       final ObjectReader reader = srcRepo.newObjectReader();
@@ -205,7 +200,8 @@ public class Main {
             }
           }
           if (taskReady) {
-            final ObjectId objectId = converter.convertTask(reader, taskKey).convert(dstRepo, inserter, converted::get, uploader);
+            final ObjectId objectId = converter.convertTask(reader, taskKey).convert(dstRepo, inserter, converted::get,
+                uploader);
             converted.put(taskKey, objectId);
             reporter.increment();
           }
@@ -233,7 +229,9 @@ public class Main {
   }
 
   @NotNull
-  private static Deque<TaskKey> processWithoutDependencies(@NotNull GitConverter converter, @NotNull Repository srcRepo, @NotNull Repository dstRepo, @NotNull ConcurrentMap<TaskKey, ObjectId> converted, @Nullable HttpUploader uploader, int threads) throws IOException, InterruptedException {
+  private static Deque<TaskKey> processWithoutDependencies(@NotNull GitConverter converter, @NotNull Repository srcRepo,
+      @NotNull Repository dstRepo, @NotNull ConcurrentMap<TaskKey, ObjectId> converted, @Nullable HttpUploader uploader,
+      int threads) throws IOException, InterruptedException {
     AtomicLong total = new AtomicLong(0);
     try (ProgressReporter reporter = new ProgressReporter("processed", total, null)) {
       final Set<TaskKey> checked = new HashSet<>();
@@ -259,8 +257,10 @@ public class Main {
               final ObjectReader reader = srcRepo.newObjectReader();
               while (!done.get()) {
                 final TaskKey taskKey = channel.take();
-                if (taskKey.getType() == GitConverter.TaskType.EndMark) break;
-                final ObjectId objectId = converter.convertTask(reader, taskKey).convert(dstRepo, inserter, converted::get, uploader);
+                if (taskKey.getType() == GitConverter.TaskType.EndMark)
+                  break;
+                final ObjectId objectId = converter.convertTask(reader, taskKey).convert(dstRepo, inserter,
+                    converted::get, uploader);
                 converted.put(taskKey, objectId);
                 reporter.increment();
               }
@@ -341,7 +341,8 @@ public class Main {
     @Override
     public void upload(@NotNull ObjectId oid, @NotNull Meta meta) {
       total.incrementAndGet();
-      futures.add(uploader.upload(meta, () -> getReader().open(oid).openStream()).thenAccept((m) -> finished.incrementAndGet()));
+      futures.add(uploader.upload(meta, () -> getReader().open(oid).openStream())
+          .thenAccept((m) -> finished.incrementAndGet()));
     }
 
     @NotNull
@@ -415,36 +416,39 @@ public class Main {
   }
 
   public static class CmdArgs {
-    @Parameter(names = {"-s", "--source"}, description = "Source repository", required = true)
+    @Parameter(names = { "-s", "--source" }, description = "Source repository", required = true)
     @NotNull
     private Path src;
-    @Parameter(names = {"-d", "--destination"}, description = "Destination repository", required = true)
+    @Parameter(names = { "-d", "--destination" }, description = "Destination repository", required = true)
     @NotNull
     private Path dst;
-    @Parameter(names = {"-c", "--cache"}, description = "Source repository", required = false)
+    @Parameter(names = { "-c", "--cache" }, description = "Source repository", required = false)
     @NotNull
     private Path cache = FileSystems.getDefault().getPath(".");
-    @Parameter(names = {"-g", "--git"}, description = "GIT repository url (ignored with --lfs parameter)", required = false)
+    @Parameter(names = { "-g",
+        "--git" }, description = "GIT repository url (ignored with --lfs parameter)", required = false)
     @Nullable
     private String git;
-    @Parameter(names = {"-l", "--lfs"}, description = "LFS server url (can be determinated by --git paramter)", required = false)
+    @Parameter(names = { "-l",
+        "--lfs" }, description = "LFS server url (can be determinated by --git paramter)", required = false)
     @Nullable
     private String lfs;
-    @Parameter(names = {"-t", "--write-threads"}, description = "IO thread count", required = false)
+    @Parameter(names = { "-t", "--write-threads" }, description = "IO thread count", required = false)
     private int writeThreads = 2;
-    @Parameter(names = {"-u", "--upload-threads"}, description = "HTTP upload thread count", required = false)
+    @Parameter(names = { "-u", "--upload-threads" }, description = "HTTP upload thread count", required = false)
     private int uploadThreads = 4;
-    @Parameter(names = {"--check-lfs"}, description = "Check LFS server settings and exit")
+    @Parameter(names = { "--check-lfs" }, description = "Check LFS server settings and exit")
     private boolean checkLfs = false;
-    @Parameter(names = {"--no-check-certificate"}, description = "Don't check the server certificate against the available certificate authorities")
+    @Parameter(names = {
+        "--no-check-certificate" }, description = "Don't check the server certificate against the available certificate authorities")
     private boolean noCheckCertificate = false;
-    @Parameter(names = {"--glob-file"}, description = "File containing glob patterns")
+    @Parameter(names = { "--glob-file" }, description = "File containing glob patterns")
     private Path globFile = null;
 
     @Parameter(description = "LFS file glob patterns")
     @NotNull
     private List<String> globs = new ArrayList<>();
-    @Parameter(names = {"-h", "--help"}, description = "Show help", help = true)
+    @Parameter(names = { "-h", "--help" }, description = "Show help", help = true)
     private boolean help = false;
   }
 }
